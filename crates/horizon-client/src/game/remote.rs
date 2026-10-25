@@ -251,6 +251,23 @@ fn number_format(f: &play::NumberFormat) -> horizon_client::scoreboard::NumberFo
 }
 
 impl Game<'_> {
+    pub(super) fn remote_player_uuid(&self, name: &str) -> Option<u128> {
+        let r = self.remote.as_ref()?;
+        let uuid = *r
+            .players
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name))?
+            .0;
+        self.remote_player_position(uuid)?;
+        Some(uuid)
+    }
+
+    pub(super) fn remote_player_position(&self, uuid: u128) -> Option<[f64; 3]> {
+        let r = self.remote.as_ref()?;
+        let id = *r.level_players.iter().find(|(_, u)| **u == uuid)?.0;
+        r.entities.get(&id).map(|entity| entity.position)
+    }
+
     /// Leave the title for a server (ConnectScreen): an empty world fed by the connection.
     pub(super) fn connect_server(&mut self, address: &str, name: &str) -> Result<()> {
         if self.defer_world_entry(super::PendingWorldEntry::Server {
@@ -3110,7 +3127,7 @@ impl Game<'_> {
             }
             self.capture_loaded_world();
         }
-        let stick = self.pad_move();
+        let stick = self.agent_movement().or_else(|| self.pad_move());
         if self.player.is_none() {
             return Ok(());
         }

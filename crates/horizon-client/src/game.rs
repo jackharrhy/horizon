@@ -16,7 +16,9 @@ mod blockctl;
 mod boats;
 mod books;
 mod bossbars;
+mod bot;
 mod breezes;
+mod broadcast;
 mod cartography;
 mod chat;
 mod clipboard;
@@ -269,6 +271,8 @@ struct Options {
     /// Render into a texture instead of the window (`--offscreen`), so a
     /// GPU the display cannot present from can still be benchmarked.
     offscreen: bool,
+    /// Client ticks independently of rendering; pictures are requested through control.
+    bot: bool,
     /// `--width` and `--height` (vanilla's own arguments): the window's
     /// starting size, 1280x720 by default.
     window_size: [u32; 2],
@@ -331,6 +335,7 @@ impl Options {
             no_pause: false,
             control: None,
             offscreen: false,
+            bot: false,
             window_size: [1280, 720],
             spikes: std::env::var("HORIZON_SPIKES")
                 .ok()
@@ -357,6 +362,9 @@ impl Options {
                         "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..64 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --dev-mod PATH          A Horizon mod (.hmod or folder) to develop: always on, reloaded when rebuilt\n  --in-frame              Run single player's world in the frame, not on its server thread\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
                         horizon_core::VANILLA_VERSION
                     );
+                    println!(
+                        "\nBot mode: --bot --server HOST[:PORT] --control-socket PATH\n  Ticks independently of drawing; screenshot requests produce fresh pictures.\n  Retains a hidden GPU renderer. See docs/horizon-bot-v1.md."
+                    );
                     return Ok(None);
                 }
                 "--dedicated" => {
@@ -367,6 +375,11 @@ impl Options {
                 "--test-terrain" => o.test_terrain = true,
                 "--no-pause" => o.no_pause = true,
                 "--offscreen" => o.offscreen = true,
+                "--bot" => {
+                    o.bot = true;
+                    o.offscreen = true;
+                    o.no_pause = true;
+                }
                 "--control" => o.control = Some(horizon_client::control::default_path()),
                 "--server-thread" => o.server_thread = true,
                 "--in-frame" | "--no-server-thread" => o.server_thread = false,
@@ -437,6 +450,11 @@ impl Options {
                     }
                 }
             }
+        }
+        if o.bot && (o.server.is_none() || o.control.is_none() || o.dedicated.is_some()) {
+            return Err(
+                "--bot requires --server and --control-socket (and is not a server role)".into(),
+            );
         }
         // The launcher's account: online-mode servers need it. A bad file
         // only leaves the game offline.
@@ -1467,6 +1485,7 @@ struct Game<'a> {
     perf: horizon_client::telemetry::Session,
     /// Control replies waiting for a rendered frame or a benchmark deadline.
     pending_screenshot: Option<std::sync::mpsc::Sender<String>>,
+    bot: bot::Presentation,
     pending_bench: Option<(Instant, std::sync::mpsc::Sender<String>)>,
     /// Recent frame times for the performance overlay.
     frame_graph: horizon_client::perf_overlay::FrameGraph,
@@ -9839,6 +9858,12 @@ impl Game<'_> {
         };
         self.audio
             .set_listener([camera.x, camera.y, camera.z], view_yaw, view_pitch);
+        if self.options.bot && self.pending_screenshot.is_some() {
+            let mut capture = self.capture_metadata();
+            capture["camera"] = serde_json::json!({ "position": [camera.x, camera.y, camera.z],
+                "yaw": view_yaw, "pitch": view_pitch, "interpolation": camera_alpha });
+            self.bot.capture = Some(capture);
+        }
         let block = [
             camera.x.floor() as i32,
             camera.y.floor() as i32,
@@ -10718,6 +10743,7 @@ impl ApplicationHandler for Game<'_> {
         self.fullscreen = horizon_client::window::FullscreenState::new(fullscreen);
         let attributes = Window::default_attributes()
             .with_title("Horizon")
+            .with_visible(!self.options.bot)
             .with_window_icon(horizon_client::window::icon());
         // Wayland names the window by its app id, which the horizon.desktop entry matches.
         #[cfg(target_os = "linux")]
@@ -11346,78 +11372,40 @@ impl ApplicationHandler for Game<'_> {
                     self.mapped_key(key, event.state == ElementState::Pressed, event.repeat)?;
                 }
                 WindowEvent::RedrawRequested => {
+                    if self.options.bot
+                        && !self.bot.live
+                        && self.bot.broadcast.is_none()
+                        && self.pending_screenshot.is_none()
+                    {
+                        return Ok(());
+                    }
                     self.observe_fullscreen();
                     let now = Instant::now();
                     let frame_cpu = self
                         .options
                         .spikes
                         .and_then(|_| horizon_client::spans::thread_cpu());
-                    let elapsed = now.duration_since(self.previous);
-                    self.frame_ticks = elapsed.as_secs_f32() * 20.0;
-                    self.previous = now;
-                    // Arrow-key camera controls belong to gameplay; chat and
-                    // other screens use the same keys for their own navigation.
-                    if self.screen == Screen::Playing
-                        && self.title.is_none()
-                        && self.sign_edit.is_none()
-                        && self.book.is_none()
-                    {
-                        let turn = |k| f32::from(u8::from(self.keys.contains(&k)));
-                        let secs = elapsed.as_secs_f32().min(0.1);
-                        self.yaw +=
-                            (turn(KeyCode::ArrowRight) - turn(KeyCode::ArrowLeft)) * 90.0 * secs;
-                        self.pitch = (self.pitch
-                            + (turn(KeyCode::ArrowDown) - turn(KeyCode::ArrowUp)) * 90.0 * secs)
-                            .clamp(-90.0, 90.0);
+                    let elapsed = now.duration_since(if self.options.bot {
+                        self.bot.previous_picture
+                    } else {
+                        self.previous
+                    });
+                    if self.options.bot {
+                        self.bot.previous_picture = now;
                     }
-                    if self.title.is_none() {
-                        horizon_client::spans::time("update_world", || self.update_world());
-                        horizon_client::spans::time("spawn_player", || self.spawn_player())?;
+                    if !self.options.bot {
+                        self.frame_ticks = elapsed.as_secs_f32() * 20.0;
+                        self.previous = now;
                     }
-                    let updated = Instant::now();
-                    self.track_toggle_screens();
-                    // For the "I'm playing" ping: an atomic, sent on when it changes.
-                    horizon_client::heartbeat::set_lan(self.is_published());
-                    let steps = self.clock.advance(elapsed);
-                    // The world ticking in the frame: once its ticks took a
-                    // tick's length, the rest are dropped (`FixedStep::tick_fits`).
-                    let in_frame = self.remote.is_none();
-                    let mut spent = Duration::ZERO;
-                    for step in 0..steps {
-                        if in_frame && !self.clock.tick_fits(spent) {
-                            if let Some(warning) = self.clock.drop_ticks(steps - step) {
-                                log::warn!("{warning}");
-                            }
-                            break;
-                        }
-                        let started = Instant::now();
-                        if self.title.is_none() && !self.pause {
-                            let tick = Instant::now();
-                            horizon_client::spans::time("tick", || self.tick())?;
-                            // In single player the tick is the integrated server's.
-                            if self.remote.is_none() {
-                                self.perf.tick(tick.elapsed().as_secs_f32() * 1000.0);
-                                self.debug_charts.log_tick(tick, tick.elapsed());
-                            }
-                            self.tick_ambience();
-                            self.tick_fov();
-                        }
-                        self.tick_win_screen()?;
-                        self.tick_music();
-                        self.tick_sound_engine();
-                        self.clock.record(started.elapsed());
-                        spent += started.elapsed();
-                        if let Some(report) = self.clock.take_sprint_report() {
-                            self.sprint_report(&report);
-                        }
-                    }
-                    self.extras_frame(elapsed);
-                    self.mods_frame(elapsed);
-                    self.extras_retry()?;
-                    self.apply_mouse_look();
-                    self.pad_look(elapsed.as_secs_f32());
-                    self.advance_flight();
+                    let updated = if self.options.bot {
+                        now
+                    } else {
+                        self.advance_client(elapsed)?
+                    };
                     let ticked = Instant::now();
+                    if self.options.bot && self.pending_screenshot.is_some() {
+                        self.bot.capture = Some(self.capture_metadata());
+                    }
                     let rendered = self.render()?;
                     if let Some(threshold) = self.options.spikes
                         && let Some(r) = self.renderer.as_ref()
@@ -11433,7 +11421,7 @@ impl ApplicationHandler for Game<'_> {
                                     format!(", cpu {:.1} ms", (end - start).as_secs_f32() * 1000.0)
                                 });
                             log::info!(
-                                "Horizon: slow frame {cpu:.1} ms{worked} ({steps} ticks): {}",
+                                "Horizon: slow frame {cpu:.1} ms{worked}: {}",
                                 horizon_client::spans::describe(&spans)
                             );
                         }
@@ -11468,7 +11456,9 @@ impl ApplicationHandler for Game<'_> {
                             self.settings.simulation_distance,
                         );
                     }
-                    self.clock.end_frame(self.pause);
+                    if !self.options.bot {
+                        self.clock.end_frame(self.pause);
+                    }
                     let finished = self
                         .renderer
                         .as_mut()
@@ -11484,7 +11474,8 @@ impl ApplicationHandler for Game<'_> {
                         let _ = reply.send(
                             match result {
                                 Ok([w, h]) => {
-                                    serde_json::json!({ "ok": true, "width": w, "height": h })
+                                    serde_json::json!({ "ok": true, "width": w, "height": h,
+                                        "capture": self.bot.capture.take() })
                                 }
                                 Err(e) => serde_json::json!({ "error": e }),
                             }
@@ -11580,6 +11571,46 @@ impl ApplicationHandler for Game<'_> {
         if self.options.frames.is_some() && self.started.elapsed() > self.options.timeout {
             self.error = Some("frame-limited run timed out".into());
             event_loop.exit();
+            return;
+        }
+        if self.options.bot {
+            let picture_due = ((self.bot.live || self.bot.broadcast.is_some())
+                && Instant::now() >= self.bot.next_picture)
+                || self.pending_screenshot.is_some();
+            if (Instant::now() >= self.bot.next || picture_due)
+                && let Err(error) = self.pump_bot()
+            {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
+            if (((self.bot.live || self.bot.broadcast.is_some())
+                && Instant::now() >= self.bot.next_picture)
+                || self.pending_screenshot.is_some())
+                && let Some(window) = &self.window
+            {
+                if self.bot.broadcast.is_some()
+                    && let Some(renderer) = self.renderer.as_mut()
+                {
+                    renderer.capture_requested = true;
+                }
+                self.window_event(event_loop, window.id(), WindowEvent::RedrawRequested);
+                let interval = self
+                    .bot
+                    .broadcast
+                    .as_ref()
+                    .map_or(Duration::from_millis(100), |b| {
+                        Duration::from_secs_f64(1.0 / f64::from(b.fps))
+                    });
+                self.bot.next_picture =
+                    bot::next_picture_deadline(self.bot.next_picture, Instant::now(), interval);
+            }
+            let wake = if self.bot.live || self.bot.broadcast.is_some() {
+                self.bot.next.min(self.bot.next_picture)
+            } else {
+                self.bot.next
+            };
+            event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
             return;
         }
         if let Some(w) = &self.window {
@@ -11900,6 +11931,7 @@ impl<'a> Game<'a> {
             frame_stats: Default::default(),
             perf: Default::default(),
             pending_screenshot: None,
+            bot: bot::Presentation::default(),
             pending_bench: None,
             flight: None,
             ui_wait: Default::default(),

@@ -28,6 +28,7 @@ const HELP: &[&str] = &[
     "fill X1 Y1 Z1 X2 Y2 Z2 BLOCK   set a box of loaded blocks",
     "resume                         leave the pause menu",
     "screenshot PATH                write the next frame as PNG",
+    "vision idle|live               bot presentation: requested pictures only, or continuous frames",
     "chat TEXT                      send a chat line or /command as if typed",
     "type TEXT                      type into the open chat box (key enter tap sends)",
     "chat-log [N]                   the newest N chat messages (default 10)",
@@ -190,6 +191,18 @@ impl Game<'_> {
             super::agent::Handled::No => {}
         }
         match words[0] {
+            "broadcast" => Ok(Some(self.broadcast_command(&words)?)),
+            "vision" => {
+                if !self.options.bot {
+                    return Err("vision needs --bot".into());
+                }
+                self.bot.live = match arg(1)? {
+                    "idle" => false,
+                    "live" => true,
+                    _ => return Err("vision idle|live".into()),
+                };
+                ok()
+            }
             "help" => Ok(Some(json!({ "commands": HELP
                 .iter()
                 .chain(super::station_control::HELP)
@@ -974,6 +987,14 @@ impl Game<'_> {
                 .map(|e| self.shown_name_tags(glam::DVec3::from_array(e))),
         });
         status["lod"] = lod;
+        status["presentation"] = json!({ "on_demand": self.options.bot, "live": self.bot.live,
+            "pumps": self.bot.pumps, "renderer_retained": self.renderer.is_some() });
+        status["presentation"]["broadcast"] = json!(
+            self.bot
+                .broadcast
+                .as_ref()
+                .map(super::broadcast::Broadcast::status)
+        );
         let (target, sampled) = self.lod.as_ref().map_or((0, 0), |lod| lod.progress());
         status["lod"]["target_tiles"] = target.into();
         status["lod"]["sampled_target_tiles"] = sampled.into();

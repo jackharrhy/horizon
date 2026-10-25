@@ -26,6 +26,7 @@ use winit::{
     event_loop::ActiveEventLoop,
     keyboard::KeyCode,
 };
+mod steering;
 
 pub(super) const HELP: &[&str] = &[
     "state                          player, world, screen and crosshair target in one reply",
@@ -39,8 +40,10 @@ pub(super) const HELP: &[&str] = &[
     "screen                         the open screen or menu, its slots and its buttons",
     "messages [N]                   recent chat and system messages, title and action bar",
     "move DIR SECONDS [--sprint] [--sneak] [--jump]  walk forward|back|left|right",
+    "move-ticks DIR TICKS           hold movement for an exact number of client ticks",
     "jump                           jump once",
     "goto X Y Z [--near R] [--sprint] [--direct] [--timeout S]  walk to a position along a path",
+    "follow NAME                    follow a visible player until stop or loss of target",
     "look-at X Y Z | look-at block X Y Z [FACE] | look-at entity ID  [--over S]",
     "turn DYAW DPITCH --over S      rotate the view with mouse motion spread over S seconds",
     "mouse-move DX DY               relative mouse motion, turned like a player's mouse",
@@ -212,6 +215,8 @@ enum TaskKind {
     Move {
         keys: Vec<KeyCode>,
         until: Instant,
+        until_tick: Option<u64>,
+        from_tick: u64,
         from: Vec3,
     },
     Wait {
@@ -256,6 +261,8 @@ struct Goto {
     replans: u32,
     jump_until: u64,
     warning: Option<String>,
+    shortcut: Option<(u64, [f64; 3])>,
+    last_progress: [f64; 3],
 }
 struct Break {
     pos: [i32; 3],
@@ -283,9 +290,8 @@ struct Glide {
     fed: (f64, f64),
     started: Instant,
     over: Duration,
-    /// The frame count when motion was last fed: the reply waits for the
-    /// frame that turns the view with it.
-    fed_frame: u64,
+    /// Input-update revision when motion was fed; turning does not require a draw.
+    fed_revision: u64,
     deadline: Instant,
     reply: Sender<String>,
     /// What `look-at` aimed at, reported once the turn is done.
@@ -296,6 +302,20 @@ struct Glide {
 pub(super) struct Agent {
     task: Option<Task>,
     glide: Option<Glide>,
+    follow: Option<Follow>,
+    steering: steering::Steering,
+}
+
+struct Follow {
+    uuid: u128,
+    name: String,
+    dimension: String,
+    route: Option<Goto>,
+    next_plan: u64,
+    waiting: bool,
+    planned_target: [f64; 3],
+    tracking_tick: Option<u64>,
+    direct: bool,
 }
 
 pub(super) enum Handled {
@@ -504,6 +524,7 @@ impl Game<'_> {
             "held": self.held().map(|s| self.stack_value(s)),
             "looking_at": self.looking_at(),
             "busy": self.agent.task.as_ref().map(|t| t.name),
+            "following": self.agent.follow.as_ref().map(|f| &f.name),
             "ticks": self.ticks,
         })
     }
@@ -846,6 +867,7 @@ impl Game<'_> {
         self.play_mouse(button, pressed)
     }
     fn release_agent_keys(&mut self) {
+        self.agent.steering.motion = None;
         for k in MOVE_KEYS {
             self.keys.remove(&k);
         }
@@ -855,6 +877,10 @@ impl Game<'_> {
         if self.right {
             let _ = self.agent_mouse(MouseButton::Right, false);
         }
+    }
+
+    pub(super) fn agent_movement(&self) -> Option<[f32; 2]> {
+        self.agent.steering.motion
     }
 
     /// Synthesize the pointer moving to GUI pixel (x, y) and a click there.
@@ -946,6 +972,7 @@ impl Game<'_> {
         let blocking = matches!(
             name,
             "move"
+                | "move-ticks"
                 | "jump"
                 | "goto"
                 | "break"
@@ -957,6 +984,9 @@ impl Game<'_> {
         );
         if blocking && let Some(task) = &self.agent.task {
             return Err(format!("busy with {}; wait for it or send stop", task.name).into());
+        }
+        if blocking && self.agent.follow.take().is_some() {
+            self.release_agent_keys();
         }
         match name {
             "state" => ok(self.state_value()),
@@ -1067,8 +1097,11 @@ impl Game<'_> {
                 let n = a.pos.first().map_or(Ok(20), |n| n.parse::<usize>())?;
                 ok(self.messages_value(n))
             }
-            "move" => {
+            "move" | "move-ticks" => {
                 self.playing()?;
+                if name == "move-ticks" && !self.options.bot {
+                    return Err("move-ticks requires --bot".into());
+                }
                 let key = match a.get(0, "DIR")? {
                     "forward" | "w" => KeyCode::KeyW,
                     "back" | "backward" | "s" => KeyCode::KeyS,
@@ -1080,7 +1113,19 @@ impl Game<'_> {
                         );
                     }
                 };
-                let seconds = a.f64(1, "SECONDS")?.clamp(0.0, 600.0);
+                let tick_count = if name == "move-ticks" {
+                    let ticks: u64 = a.get(1, "TICKS")?.parse()?;
+                    if !(1..=12000).contains(&ticks) {
+                        return Err("TICKS must be 1..12000".into());
+                    }
+                    Some(ticks)
+                } else {
+                    None
+                };
+                let seconds = match tick_count {
+                    Some(ticks) => ticks as f64 / 20.0,
+                    None => a.f64(1, "SECONDS")?.clamp(0.0, 600.0),
+                };
                 let mut keys = vec![key];
                 if a.has("sprint") {
                     keys.push(KeyCode::ControlLeft);
@@ -1097,8 +1142,18 @@ impl Game<'_> {
                 let from = self.player.as_ref().map_or(Vec3::ZERO, |p| p.position);
                 let until = Instant::now() + Duration::from_secs_f64(seconds);
                 self.start_task(
-                    "move",
-                    TaskKind::Move { keys, until, from },
+                    if tick_count.is_some() {
+                        "move-ticks"
+                    } else {
+                        "move"
+                    },
+                    TaskKind::Move {
+                        keys,
+                        until,
+                        until_tick: tick_count.map(|ticks| self.ticks + ticks),
+                        from_tick: self.ticks,
+                        from,
+                    },
                     reply,
                     seconds + 5.0,
                 )
@@ -1117,6 +1172,29 @@ impl Game<'_> {
                     reply,
                     5.0,
                 )
+            }
+            "follow" => {
+                self.playing()?;
+                if self.agent.task.is_some() || self.agent.glide.is_some() {
+                    return Err("stop the current action before following".into());
+                }
+                let name = a.get(0, "NAME")?;
+                let uuid = self
+                    .remote_player_uuid(name)
+                    .ok_or("player is not visible in this dimension")?;
+                self.release_agent_keys();
+                self.agent.follow = Some(Follow {
+                    uuid,
+                    name: name.to_owned(),
+                    dimension: self.dim.id().to_owned(),
+                    route: None,
+                    next_plan: 0,
+                    waiting: false,
+                    planned_target: [0.0; 3],
+                    tracking_tick: None,
+                    direct: false,
+                });
+                ok(json!({ "ok": true, "following": name }))
             }
             "goto" => {
                 self.playing()?;
@@ -1148,6 +1226,8 @@ impl Game<'_> {
                     replans: 0,
                     jump_until: 0,
                     warning,
+                    shortcut: None,
+                    last_progress: [p.x, p.y, p.z],
                 };
                 self.start_task("goto", TaskKind::Goto(Box::new(goto)), reply, timeout)
             }
@@ -1613,6 +1693,7 @@ impl Game<'_> {
                 self.start_task("wait", TaskKind::Wait { until_tick }, reply, timeout)
             }
             "stop" => {
+                self.agent.follow = None;
                 let cancelled = self.agent.task.take().map(|t| {
                     let _ = t.reply.send(
                         json!({ "error": "cancelled by stop", "cancelled": true }).to_string(),
@@ -1680,7 +1761,7 @@ impl Game<'_> {
             fed: (0.0, 0.0),
             started: now,
             over,
-            fed_frame: self.frames,
+            fed_revision: self.input_revision(),
             deadline: now + over + Duration::from_secs(10),
             reply: reply.clone(),
             aim,
@@ -1727,9 +1808,9 @@ impl Game<'_> {
             self.mouse.add_motion(step.0, step.1);
             self.agent_pointer = true;
             g.fed = due;
-            g.fed_frame = self.frames;
+            g.fed_revision = self.input_revision();
         }
-        if t >= 1.0 && self.frames > g.fed_frame {
+        if t >= 1.0 && self.input_revision() > g.fed_revision {
             let extra = match g.aim {
                 Some("block") | Some("entity") => json!({ "target": self.looking_at() }),
                 _ => json!({}),
@@ -1739,7 +1820,7 @@ impl Game<'_> {
         }
         if now >= g.deadline {
             let _ = g.reply.send(
-                json!({ "error": "no frame was drawn to turn the view", "yaw": self.yaw, "pitch": self.pitch })
+                json!({ "error": "no input update applied the turn", "yaw": self.yaw, "pitch": self.pitch })
                     .to_string(),
             );
             return;
@@ -1750,6 +1831,7 @@ impl Game<'_> {
     /// Advance the running agent task; reply when it ends.
     pub(super) fn advance_agent(&mut self) {
         self.advance_glide();
+        self.advance_follow();
         let Some(mut task) = self.agent.task.take() else {
             return;
         };
@@ -1772,6 +1854,85 @@ impl Game<'_> {
             .map_or([0.0; 3], |p| [p.position.x, p.position.y, p.position.z])
     }
 
+    fn advance_follow(&mut self) {
+        let Some(mut follow) = self.agent.follow.take() else {
+            return;
+        };
+        self.release_agent_keys();
+        if self.screen != Screen::Playing
+            || self.player.is_none()
+            || self.dim.id() != follow.dimension
+        {
+            return;
+        }
+        let Some(target) = self.remote_player_position(follow.uuid) else {
+            return;
+        };
+        let p = self.position();
+        let distance = dist(p, target);
+        if distance > 48.0 {
+            return;
+        }
+        if distance <= 2.5 || (follow.waiting && distance < 3.5) {
+            follow.waiting = true;
+            follow.route = None;
+            if self.options.bot {
+                self.look_bot([target[0], target[1] + 1.62, target[2]], None);
+            }
+        } else {
+            follow.waiting = false;
+            if follow.tracking_tick != Some(self.ticks) {
+                follow.tracking_tick = Some(self.ticks);
+                follow.direct = self.options.bot && self.clear_walk_segment(target);
+                if follow.direct
+                    && let Some(route) = follow.route.as_mut()
+                {
+                    route.target = target;
+                    route.shortcut = None;
+                }
+            }
+            if self.ticks >= follow.next_plan
+                && follow
+                    .route
+                    .as_ref()
+                    .is_none_or(|_| !follow.direct && dist(follow.planned_target, target) > 1.0)
+            {
+                follow.next_plan = self.ticks + 5;
+                follow.planned_target = target;
+                let previous = follow.route.take();
+                let from = [
+                    p[0].floor() as i32,
+                    p[1].round() as i32,
+                    p[2].floor() as i32,
+                ];
+                follow.route = self.find_path(from, target, 2.0).map(|path| Goto {
+                    target,
+                    near: 2.0,
+                    sprint: false,
+                    path,
+                    next: 1,
+                    progress_tick: previous.as_ref().map_or(self.ticks, |r| r.progress_tick),
+                    replans: previous.as_ref().map_or(0, |r| r.replans),
+                    jump_until: previous.as_ref().map_or(0, |r| r.jump_until),
+                    warning: None,
+                    shortcut: None,
+                    last_progress: p,
+                });
+            }
+            if let Some(route) = follow.route.as_mut()
+                && let Some(result) =
+                    self.step_goto(route, false, Some([target[0], target[1] + 1.62, target[2]]))
+            {
+                self.release_agent_keys();
+                if result.get("error").is_some() {
+                    return;
+                }
+                follow.route = None;
+            }
+        }
+        self.agent.follow = Some(follow);
+    }
+
     /// One frame of a task: Some(reply) when it is over.
     fn step_task(&mut self, kind: &mut TaskKind, timed_out: bool) -> Option<Value> {
         // Leaving the world (death, a screen, the title) ends movement tasks.
@@ -1783,20 +1944,33 @@ impl Game<'_> {
             None
         };
         match kind {
-            TaskKind::Move { keys, until, from } => {
+            TaskKind::Move {
+                keys,
+                until,
+                until_tick,
+                from_tick,
+                from,
+            } => {
                 if let Some(why) = interrupted {
                     return Some(json!({ "error": why, "position": self.position() }));
                 }
                 for &k in keys.iter() {
                     self.keys.insert(k);
                 }
-                if Instant::now() < *until && !timed_out {
+                let holding =
+                    until_tick.map_or_else(|| Instant::now() < *until, |tick| self.ticks < tick);
+                if holding && !timed_out {
                     return None;
+                }
+                if holding && until_tick.is_some() {
+                    return Some(
+                        json!({ "error": "timed out before movement ticks completed", "position": self.position() }),
+                    );
                 }
                 let to = self.position();
                 Some(
                     json!({ "ok": true, "from": [from.x, from.y, from.z], "position": to,
-                             "moved": dist([from.x, from.y, from.z], to) }),
+                             "moved": dist([from.x, from.y, from.z], to), "client_ticks": self.ticks.saturating_sub(*from_tick) }),
                 )
             }
             TaskKind::Wait { until_tick } => {
@@ -1834,7 +2008,7 @@ impl Game<'_> {
                         json!({ "error": format!("the {} screen opened", self.screen_label()), "position": self.position() }),
                     );
                 }
-                self.step_goto(goto, timed_out)
+                self.step_goto(goto, timed_out, None)
             }
             TaskKind::Break(b) => self.step_break(b, timed_out, interrupted),
             TaskKind::Click {
@@ -1908,7 +2082,12 @@ impl Game<'_> {
         }
     }
 
-    fn step_goto(&mut self, g: &mut Goto, timed_out: bool) -> Option<Value> {
+    fn step_goto(
+        &mut self,
+        g: &mut Goto,
+        timed_out: bool,
+        gaze: Option<[f64; 3]>,
+    ) -> Option<Value> {
         let p = self.position();
         let on_ground = self.player.as_ref().is_some_and(|p| p.ground.on_ground);
         let horizontal =
@@ -1945,6 +2124,13 @@ impl Game<'_> {
             aim = c;
             break;
         }
+        if self.options.bot {
+            aim = self.bot_waypoint(g, aim);
+            if horizontal(p, g.last_progress) > 0.5 {
+                g.progress_tick = self.ticks;
+                g.last_progress = p;
+            }
+        }
         // Stuck: jump, then replan from here.
         let stalled = self.ticks.saturating_sub(g.progress_tick);
         if stalled > 60 && on_ground {
@@ -1966,15 +2152,25 @@ impl Game<'_> {
             if let Some(path) = self.find_path(from, g.target, g.near) {
                 g.path = path;
                 g.next = 1;
+                g.shortcut = None;
             }
             g.progress_tick = self.ticks;
         }
         let d = [aim[0] - p[0], aim[2] - p[2]];
-        if d[0].abs() + d[1].abs() > 1e-3 {
+        if self.options.bot {
+            self.drive_bot(
+                aim,
+                (horizontal(p, g.target) - g.near).max(0.0),
+                g.sprint,
+                gaze,
+            );
+        } else if d[0].abs() + d[1].abs() > 1e-3 {
             self.yaw = (-d[0]).atan2(d[1]).to_degrees() as f32;
         }
-        self.keys.insert(KeyCode::KeyW);
-        if g.sprint {
+        if !self.options.bot {
+            self.keys.insert(KeyCode::KeyW);
+        }
+        if g.sprint && !self.options.bot {
             self.keys.insert(KeyCode::ControlLeft);
         }
         // Step up onto the next block, or out of water.

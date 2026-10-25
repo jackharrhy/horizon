@@ -50,6 +50,7 @@ Development builds that link quickly: `cargo build --profile fast -p horizon-cli
 | `--creative` | Creative mode (instant breaking, pick block) |
 | `--render-distance N` | Chunks, 2..64 (default 12) |
 | `--resources PATH` | Prepared resource directory |
+| `--bot` | Experimental demand-rendered client; requires `--server` and `--control-socket`. See [bot v1](horizon-bot-v1.md). |
 
 | Control | Action |
 | --- | --- |

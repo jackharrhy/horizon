@@ -26,6 +26,8 @@ Every command `horizon-ctl` takes, its MCP tool in `horizon-ctl mcp` (the launch
 | Command | MCP tool | What it does | Arguments |
 | --- | --- | --- | --- |
 | `events [--since SEQ]` | `events` | What happened since SEQ, oldest first: screens, chat, deaths, respawns, items gained or lost, dimensions, worlds | `--since` (integer): only events after this seq |
+| `broadcast [start 127.0.0.1:PORT FPS [audio]\|audio on\|audio off\|stop]` | `broadcast` | Stream native bot frames and optional game audio to a local encoder | `arguments` (text): start LOOPBACK:PORT FPS [audio], audio on/off, or stop |
+| `vision idle\|live` | `vision` | Select demand-driven or continuous bot rendering | `mode` (idle, live, required): presentation mode |
 | `state` | `state` | Player, world, screen and crosshair target in one reply | none |
 | `looking-at` | `looking_at` | The block or entity under the crosshair | none |
 | `entities [RADIUS] [TYPE]` | `entities` | Mobs, dropped items and experience orbs near the player, nearest first | `radius` (number): search radius in blocks (default 32)<br>`type` (string): entity type filter |
@@ -42,6 +44,8 @@ Every command `horizon-ctl` takes, its MCP tool in `horizon-ctl mcp` (the launch
 
 | Command | MCP tool | What it does | Arguments |
 | --- | --- | --- | --- |
+| `move-ticks forward\|back\|left\|right TICKS` | `move_ticks` | Hold movement for an exact number of client ticks | `direction` (forward, back, left, right, required): direction relative to the view<br>`ticks` (integer, required): client ticks, 1..12000 |
+| `follow NAME` | `follow` | Follow a visible player until stopped | `name` (string, required): visible player name |
 | `move forward\|back\|left\|right SECONDS [--sprint] [--sneak] [--jump]` | `move` | Walk in a direction relative to the view for a time | `direction` (forward, back, left, right, required): direction relative to the view<br>`seconds` (number, required): how long to walk<br>`--sprint` (boolean): sprint<br>`--sneak` (boolean): sneak<br>`--jump` (boolean): keep jumping |
 | `goto X Y Z [--near R] [--sprint] [--direct] [--timeout S]` | `goto` | Walk to a position, finding a path through loaded terrain | `x` (number, required): X coordinate<br>`y` (number, required): Y coordinate<br>`z` (number, required): Z coordinate<br>`--near` (number): arrive within this many blocks (default 0.6)<br>`--sprint` (boolean): sprint<br>`--direct` (boolean): walk straight when no path is found<br>`--timeout` (number): give up after this many seconds (default 60) |
 | `jump` | `jump` | Jump once and reply when landed | none |

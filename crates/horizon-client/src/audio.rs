@@ -144,6 +144,7 @@ type Stream = cpal::Stream;
 type Stream = std::convert::Infallible;
 pub struct Audio {
     _stream: Option<Stream>,
+    capture_enabled: bool,
     pub engine: SoundEngine,
     backend: MixerBackend,
     /// Record `Heard` sounds (the subtitle overlay is listening).
@@ -370,8 +371,7 @@ fn distance_gain(linear: Option<f32>, distance: f32) -> f32 {
         Some(_) => 0.0,
     }
 }
-// Only the output stream mixes; a build without one (no `audio` feature) never does.
-#[cfg_attr(not(feature = "audio"), allow(dead_code))]
+// Both speaker output and capture-only streams use this mixer.
 fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
     data.fill(0.0);
     let listener = mixer.listener;
@@ -578,6 +578,7 @@ impl Audio {
         engine.loaded = live;
         Self {
             _stream: stream,
+            capture_enabled: false,
             engine,
             backend: MixerBackend {
                 mixer,
@@ -654,6 +655,31 @@ impl Audio {
             m.listener_yaw = yaw;
             m.listener_pitch = pitch;
         }
+    }
+
+    /// Mix to a recording sink without opening the computer's speakers.
+    pub fn capture_output(&mut self, enabled: bool) -> Result<()> {
+        if enabled && self._stream.is_some() {
+            return Err("game-audio capture currently requires disabled speaker output".into());
+        }
+        if self.capture_enabled != enabled {
+            self.stop_all();
+            self.capture_enabled = enabled;
+            self.backend.live = enabled || self._stream.is_some();
+            self.engine.loaded = self.backend.live;
+        }
+        Ok(())
+    }
+
+    pub fn capture_pcm(&mut self, frames: usize) -> Vec<f32> {
+        if !self.capture_enabled {
+            return Vec::new();
+        }
+        let mut samples = vec![0.0; frames * 2];
+        if let Ok(mut mixer) = self.backend.mixer.lock() {
+            mix(&mut mixer, &mut samples, 2, 48_000);
+        }
+        samples
     }
     /// Sync the volume options, refreshing the categories that changed
     /// (the option sliders' `refreshCategoryVolume`).
@@ -866,6 +892,35 @@ impl Sounds for Audio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_mixes_without_speakers_and_disabling_stops_mixing() {
+        let mut audio = Audio::silent(Path::new("/nonexistent/horizon-test-assets"));
+        assert!(audio.capture_pcm(4).is_empty());
+        audio.capture_output(true).unwrap();
+        audio
+            .backend
+            .mixer
+            .lock()
+            .unwrap()
+            .channels
+            .insert(1, channel(vec![0.25; 16], None, [0.0, 0.0, 1.0], false));
+        let samples = audio.capture_pcm(4);
+        assert_eq!(samples.len(), 8);
+        assert!(samples.iter().any(|sample| *sample > 0.0));
+        assert_eq!(
+            audio.backend.mixer.lock().unwrap().channels[&1].position,
+            4.0
+        );
+        assert!(audio._stream.is_none());
+        audio.capture_output(false).unwrap();
+        assert!(audio.capture_pcm(4).is_empty());
+        assert!(!audio.backend.live && !audio.engine.loaded);
+        assert_eq!(
+            audio.backend.mixer.lock().unwrap().channels[&1].position,
+            4.0
+        );
+    }
 
     #[test]
     fn button_click_uses_vanilla_ui_parameters_without_advancing_world_random() {

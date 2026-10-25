@@ -288,6 +288,15 @@ struct BorderUniform {
     color: [f32; 4],
     offset: [f32; 4],
 }
+struct PendingCapture {
+    buffer: wgpu::Buffer,
+    ready: std::sync::mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>,
+    size: [u32; 2],
+    row: usize,
+    bgra: bool,
+    captured_at: std::time::Instant,
+}
+
 pub struct Renderer {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -472,6 +481,8 @@ pub struct Renderer {
     pub screenshot: Option<PathBuf>,
     /// Outcome of the last screenshot: frame size, or the error.
     pub screenshot_result: Option<std::result::Result<[u32; 2], String>>,
+    pub capture_requested: bool,
+    capture_pending: std::collections::VecDeque<PendingCapture>,
     /// Brightness option (lightmap gamma), 0..1.
     pub gamma: f32,
     /// Optional full-light lightmap (Horizon Extras).
@@ -2311,6 +2322,8 @@ impl Renderer {
             started: Instant::now(),
             screenshot: None,
             screenshot_result: None,
+            capture_requested: false,
+            capture_pending: std::collections::VecDeque::new(),
             gamma: 0.5,
             fullbright: false,
             animated_textures: true,
@@ -4000,6 +4013,15 @@ impl Renderer {
                 (&view_target, self.config.format.remove_srgb_suffix()),
             );
         }
+        let stream_readback = if self.capture_requested
+            && self.capture_pending.len() < 2
+            && self.config.format.block_copy_size(None) == Some(4)
+        {
+            Some(self.copy_frame(&mut encoder, &target_texture))
+        } else {
+            None
+        };
+        self.capture_requested = false;
         let readback = self.screenshot.take().and_then(|path| {
             // The copy and PNG writer both assume 8-bit pixels; a float surface would make
             // the row stride too small for the copy and abort in validation.
@@ -4025,6 +4047,20 @@ impl Renderer {
             self.first_frame = FirstFrame::Drawn;
         }
         let submission = crate::spans::time("submit", || self.queue.submit([commands]));
+        if let Some(buffer) = stream_readback {
+            let (sender, ready) = std::sync::mpsc::channel();
+            buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+                let _ = sender.send(result);
+            });
+            self.capture_pending.push_back(PendingCapture {
+                buffer,
+                ready,
+                size: [self.config.width, self.config.height],
+                row: self.padded_row() as usize,
+                bgra: self.config.format.remove_srgb_suffix() == wgpu::TextureFormat::Bgra8Unorm,
+                captured_at: std::time::Instant::now(),
+            });
+        }
         if let Some(cull) = &mut self.cull {
             cull.submitted();
         }
@@ -4073,6 +4109,40 @@ impl Renderer {
     }
 }
 impl Renderer {
+    /// Poll GPU readback without waiting for it on the simulation thread.
+    pub fn poll_capture(&mut self) -> Option<([u32; 2], Vec<u8>, std::time::Instant)> {
+        self.capture_pending.front()?;
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let capture = self.capture_pending.front()?;
+        let result = match capture.ready.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(_) => {
+                self.capture_pending.pop_front();
+                return None;
+            }
+        };
+        let capture = self.capture_pending.pop_front()?;
+        result.ok()?;
+        let [width, height] = capture.size;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        {
+            let data = capture.buffer.get_mapped_range(..).ok()?;
+            for y in 0..height as usize {
+                pixels.extend_from_slice(
+                    &data[y * capture.row..y * capture.row + width as usize * 4],
+                );
+            }
+            if capture.bgra {
+                for px in pixels.as_chunks_mut::<4>().0 {
+                    px.swap(0, 2);
+                }
+            }
+        }
+        capture.buffer.unmap();
+        Some((capture.size, pixels, capture.captured_at))
+    }
+
     fn padded_row(&self) -> u32 {
         (self.config.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
     }
