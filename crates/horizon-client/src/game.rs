@@ -456,16 +456,11 @@ impl Options {
                 "--bot requires --server and --control-socket (and is not a server role)".into(),
             );
         }
-        // The launcher's account: online-mode servers need it. A bad file
-        // only leaves the game offline.
-        if let Some(path) = session_file.filter(|p| !p.is_empty()) {
-            match horizon_client::auth::AuthSession::load(path.as_ref()) {
-                Ok(session) => {
-                    o.player_name = Some(session.name.clone());
-                    horizon_client::auth::set_current(session);
-                }
-                Err(e) => eprintln!("Horizon: not signed in: {e}"),
-            }
+        if let Some(path) = session_file {
+            let session = horizon_client::auth::AuthSession::load(path.as_ref())
+                .map_err(|e| format!("Horizon: authenticated launch refused: {e}"))?;
+            o.player_name = Some(session.name.clone());
+            horizon_client::auth::set_current(session);
         }
         Ok(Some(o))
     }

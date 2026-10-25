@@ -98,6 +98,11 @@ machine can read it in the process list. Horizon keeps it out of argv:
 
 ## Online-mode login (game)
 
+An explicitly supplied `--session-file` (or `HORIZON_SESSION_FILE`) is required to load
+successfully: a missing, stale, public or malformed file aborts startup rather than falling
+back to an offline identity. Omitting authentication entirely still permits offline play.
+Local control `status.identity` exposes only the profile name and UUID, never tokens.
+
 Vanilla's `ClientHandshakePacketListenerImpl.handleHello`, `Crypt` and authlib's
 `MinecraftServicesSessionService.joinServer`:
 

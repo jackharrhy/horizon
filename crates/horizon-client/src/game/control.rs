@@ -705,7 +705,8 @@ impl Game<'_> {
             }
             "disconnect" => {
                 if self.remote.is_none() {
-                    return Err("not connected to a server".into());
+                    self.extras_left();
+                    return ok();
                 }
                 self.leave_server(None)?;
                 ok()
@@ -987,6 +988,9 @@ impl Game<'_> {
                 .map(|e| self.shown_name_tags(glam::DVec3::from_array(e))),
         });
         status["lod"] = lod;
+        status["identity"] = json!(horizon_client::auth::current().map(|session| json!({
+            "name": session.name, "uuid": format!("{:032x}", session.uuid),
+        })));
         status["presentation"] = json!({ "on_demand": self.options.bot, "live": self.bot.live,
             "pumps": self.bot.pumps, "renderer_retained": self.renderer.is_some() });
         status["presentation"]["broadcast"] = json!(
